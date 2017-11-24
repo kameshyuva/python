@@ -1,0 +1,254 @@
+#!/usr/bin/env python
+
+""" CLUSTER DETAILS
+"""
+ESHOME="ELASTICSEARCH_HOME_ABS_PATH"
+
+""" IMPORT required modules
+"""
+import logging
+from elasticsearch import Elasticsearch
+import os, json, sys, subprocess, time, argparse, errno
+from pprint import pprint
+
+# user logger module
+import logger
+
+logWrt = logger.Logger()
+logWrt.setup_logging()
+
+""" custom exception handlers( derives from the python built-in Exception class)
+"""
+@logWrt.logwrap
+class ProcessNotKilledProperly(Exception):
+      """ Raise exception when the process doesn't get killed poerperly """
+class InvalidUser(Exception):
+      """ Raise exception if the process is started as 'root' user """
+
+""" SYSTEM functions
+"""
+@logWrt.logwrap
+class System:
+    def checkSsh(self,hostIP):
+        proc = subprocess.Popen('ifconfig eth0 | grep "inet\ addr" | cut -d: -f2 | cut -d" " -f1', shell=True, stdout=subprocess.PIPE)
+        systemIP = proc.communicate()[0].rstrip()
+        return False if systemIP == ESHOST else True
+    def checkProcess(self,procName):
+        ssh=self.checkSsh(ESHOST)
+        if ssh == False:
+           chkCmd="ps auxwww |grep "+procName+"| grep -v grep"
+        else:
+           chkCmd="ssh "+ESHOST+" 'ps auxwww |grep "+procName+"| grep -v grep'"
+        logging.info("check process command : %s",chkCmd)
+        proc = subprocess.Popen(chkCmd, stdout=subprocess.PIPE, shell=True)
+        out,err = proc.communicate()
+        if err:
+           logging.exception(" error checking  process : %s : %s",procName,err)
+        if out and not out.isspace():
+           procPid = out.split()[1]
+           return procPid
+    def killProcess(self,pidOfProcess,sigterm=0):
+        try:
+          ssh=self.checkSsh(ESHOST)
+          if ssh == False:
+             killCmd = "kill -"+str(sigterm)+" "+str(pidOfProcess)
+          else:
+             killCmd = "ssh "+ESHOST+" 'kill -"+str(sigterm)+" "+str(pidOfProcess)+"'"
+          logging.info("kill command : %s",killCmd)
+          proc = subprocess.Popen(killCmd, stdout=subprocess.PIPE, shell=True)
+          out,err = proc.communicate()
+          if proc.returncode != 0:
+             logging.exception("Unable kill process pid %s",pidOfProcess)
+             raise ProcessNotKilledProperly('kill process pid %s error with reason %s ',pidOfProcess, err)
+        except ( ProcessNotKilledProperly, Exception ) as e:
+          raise e
+    def restartProcess(self,procName):
+        try:
+          processPid = self.checkProcess(procName)
+          while processPid and not processPid.isspace():
+              logging.info("running pid : %s",processPid)
+              try:
+                pid = int(processPid)
+                logging.info("check if process still exists..")
+                self.killProcess(pid,0)
+                logging.info("send kill signal to system..")
+                self.killProcess(pid,9)
+                time.sleep(3)
+                logging.info("check if process killed succesfully..")
+                processPid = self.checkProcess(procName)
+                if not processPid:
+                   break
+              except Exception, e:
+                raise e
+          ssh=self.checkSsh(ESHOST)
+          if ssh == False:
+             startCmd="nohup "+ESHOME+"/bin/elasticsearch &>"+ESHOME+"/bin/nohup.out &"
+          else:
+             startCmd="ssh "+ESHOST+" 'nohup "+ESHOME+"/bin/elasticsearch &>"+ESHOME+"/bin/nohup.out &'"
+          logging.info("start command : %s ",startCmd)
+          proc = subprocess.Popen(startCmd, stdout=subprocess.PIPE, shell=True)
+          out, err = proc.communicate()
+          if err:
+             logging.exception(" error starting the service , %s", err)
+          else:
+             logging.info("start signal sent. waiting for 60 seconds for startup to complete..")
+             time.sleep(60)
+             logging.info("polling elasticsearch on %s", ESHOST)
+          if not err:
+             while True:
+                isRunning = self.checkProcess(procName)
+                if isRunning:
+                   break
+                else:
+                   logging.exception('Elasticsearch down on %s',ESHOST)
+        except Exception, e:
+          raise e
+
+""" ELASTICSEARCH classes
+"""
+@logWrt.logwrap
+class CheckClusterStat:
+    def __init__(self,es):
+        self.es=es
+    def getRelocatingShards(self):
+        relocatingShards = self.es.cluster.health()
+        relocShrd = relocatingShards['relocating_shards']
+        return relocShrd if relocShrd !=0 else True
+    def getUnassignedShards(self):
+        unassignedShards=self.es.cluster.health()
+        return False if unassignedShards['unassigned_shards']>0 else True
+    def checkESStatus(self):
+        status = self.es.cluster.health()   # es.cluster.health() also works
+        return status
+    def waitUntilReqhealth(self,status,retryCnt=3):
+        logging.info('Waiting until cluster is %s', status)
+        while retryCnt>0:
+              health = self.checkESStatus()
+              if health['status'] == status:
+                 return True
+              else:
+                 logging.info("cluster status is %s. retrying in 20 secs",health['status'])
+                 time.sleep(20)
+                 retryCnt-=1
+        return False
+
+# LOCAL class for script
+@logWrt.logwrap
+class ElasticSearch:
+      def __init__(self,es,system=None):
+         self.es = es
+         self.sanityChk = CheckClusterStat(es)
+         self.system = system
+      def rollingRestart(self):
+          try:
+             system.restartProcess('elasticsearch')
+             healthChk = CheckClusterStat(es)
+             returnVal = healthChk.waitUntilReqhealth(status='yellow')
+             if returnVal is True:
+                logging.info(" restart node %s : successful.",ESHOST )
+             else:
+                returnVal = healthChk.waitUntilReqhealth(status='green')
+                if returnVal != True:
+                   logging.error(" restart node %s : fail. ",ESHOST )
+                   sys.exit(1)
+                else:
+                   logging.info(" restart node %s : partial. ",ESHOST )
+                   logging.warn(" either shard allocation or node restart was partial. check logs.. ")
+          except Exception, e:
+             raise e
+      def getSettings(self):
+          curSetting = es.cluster.get_settings()
+          return curSetting
+      def putSettings(self,setting):
+          ret = es.cluster.put_settings(setting)
+          return ret['acknowledged'] is True
+      def shardAllocation(self,state="disable",persistent=False):
+          phase = persistent and 'persistent' or 'transient'
+          value="none" if state=='disable' else 'all'
+          logging.info('checking shard allocation..')
+          currentSetting = self.getSettings()
+          if not currentSetting[phase]['cluster']['routing']['allocation']['enable'] == value:
+             logging.info('%s shard allocation',state)
+             setting=json.dumps({ phase : { 'cluster.routing.allocation.enable' : value }})
+             self.putSettings(setting)
+          else:
+             logging.info("already in %s-d state",state)
+      def sanityCheck(self):
+          logging.info("sanity check on cluster. node spot picked : %s",ESHOST)
+          curHealth = self.sanityChk.checkESStatus()
+          logging.info(" cluster status : %s", curHealth['status'])
+          if curHealth['status'] != 'green':
+             logging.error("cluster health check failed: no green status. Check your cluster health.  quitting..")
+             sys.exit(1)
+          logging.info("cheking relocating shards..")
+          if self.sanityChk.getRelocatingShards() is False:
+             logging.error("cluster is rebalancing - There are currently %s shards relocating. quitting...",relocatingShards)
+             sys.exit(1)
+          logging.info("cheking unassigned shards..")
+          if self.sanityChk.getUnassignedShards() is False:
+             logging.error("There are unassigned shards - handle that before trying a rolling restart. quitting..")
+             sys.exit(1)
+          logging.info(" sanity check done.")
+
+if __name__ == '__main__':
+    try:
+       # READ arguments
+       parser = argparse.ArgumentParser(description='Elasticsearch rolling restart cluster : without any option, the script will 1. check cluster health, 2. Disable shard alloaction, 3. Restart nodes one by one, 4. check if restart was successful, 5. enable shard allocation. Enable logging to console to see more details or check log file in logs')
+       parser.add_argument('ESHOST',action="store", help="elasticsearch host. comma separated list if more than one. ")
+       parser.add_argument('-forcerestart', '--forcerestart',action="store_true", default=False , help="force restart elasticsearch. CAUTION : check cluster status manually before forcing a restart")
+       parser.add_argument('-skiphealthcheck', '--skiphealthcheck',action="store_true", default=False , help="skip helth check to directly restart nodes/cluster. CAUTION:  Make sure you maually check the cluster for its state before enabling this option.")
+       parser.add_argument('-onlyhealthcheck', '--onlyhealthcheck',action="store_true", default=False , help="only health check. returns cluster , relocating shards, unassigned shards statuses.")
+
+       args = parser.parse_args()
+       ESCLUSTER = args.ESHOST.split(",")
+       ForceRestart = args.forcerestart
+       SkipHealthCheck = args.skiphealthcheck
+       OnlyHealthCheck = args.onlyhealthcheck
+
+       logging.basicConfig(format='%(asctime)s [%(name)s] [%(levelname)s] [%(threadName)s] [msg:] %(message)s', level=logging.INFO)
+
+       if not SkipHealthCheck:
+          # pick a node from the list and do a sanity check in the start of the process
+          for ESHOST in ESCLUSTER:
+              estemp = Elasticsearch( [ESHOST] )
+              dryRun = ElasticSearch(estemp)
+              dryRun.sanityCheck()
+              break
+
+       if OnlyHealthCheck:
+          sys.exit(0)
+
+       proc = subprocess.Popen('whoami', shell=True, stdout=subprocess.PIPE)
+       userName = proc.communicate()[0].rstrip()
+       print userName
+       if userName == 'root':
+          raise InvalidUser(" don't run elasticsearch as 'root' user")
+
+       #ESHOST = ",".join(["%s" % (k) for k in ESCLUSTER])
+       for ESHOST in ESCLUSTER:
+           logging.basicConfig( format='%(asctime)s [%(name)s] [%(levelname)s] [msg:] %(message)s', level=logging.DEBUG )
+           es = Elasticsearch( [ ESHOST ] )
+           process = 'elasticsearch'
+           system = System()
+           isrunning = system.checkProcess(process)
+           if not isrunning:
+              logging.warn(" %s is not running in %s. ",process ,ESHOST )
+              continue
+           myES = ElasticSearch(es)
+           if not ForceRestart:
+              # disable shard allocation
+              myES.shardAllocation(state="disable")
+           # restart node.  needs rsa key auth for connecting to different hosts
+           myES.rollingRestart()
+
+       # pick a node from the list and enable shard allocation if the execution reached here
+       for ESHOST in ESCLUSTER:
+            estemp = Elasticsearch( [ESHOST] )
+            shardAlloc = ElasticSearch(estemp)
+            shardAlloc.shardAllocation(state="enable")
+            break
+    except InvalidUser, i:
+           logging.exception(" execution failed with exception : %s", i)
+    except Exception, e:
+            logging.exception("exception %s", e)
+            raise e
