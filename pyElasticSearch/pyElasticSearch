@@ -1,0 +1,236 @@
+#!/usr/bin/env python
+
+"""  1. set ELASTICSEARCH host, port
+     2. config file to read logging properties
+"""
+
+""" IMPORT required modules
+"""
+import sys, re, json, argparse, os, time, datetime
+from elasticsearch import Elasticsearch
+import logging
+from pprint import pprint
+from Queue import Queue
+import threading
+#USER DEFINED
+from ElasticSearch import ElasticSearch
+import logger
+
+logWrt = logger.Logger()
+logWrt.setup_logging()
+
+@logWrt.logwrap
+#LOAD json
+def loadJson(file):
+    with open(file,"r") as f:
+      data=json.load(f)
+    for k in data['hits']['hits']:
+        yield k
+
+#For threading.
+@logWrt.logwrap
+def threader(func):
+    while True:
+      # gets an worker from the queue
+      bulkData = q.get()
+      # Run an object with the msg put to the queue (thread)
+      func(bulkData)
+      # completed with the job
+      q.task_done()
+
+@logWrt.logwrap
+def optimizeBulk(onOffFlag=None, replicaPrevState=None):
+    if onOffFlag == "start":
+       logging.info('optimizing bulk : disabling index.refresh_interval on  %s before bulk..',ESINDEXNAME)
+       ES.putSettings(index=ESINDEXNAME,body={ "refresh_interval" : "-1" })
+       #get current replicas
+       curIdxSeting = ES.getSettings(index=ESINDEXNAME)
+       logging.info('optimizing bulk : setting index.number_of_replicas=0 on %s before bulk..',ESINDEXNAME)
+       ES.putSettings(index=ESINDEXNAME,body={ "number_of_replicas" : "0" })
+       return curIdxSeting
+    elif onOffFlag == "end":
+       logging.info('optimizing bulk : setting refresh_interval 1s on %s after bulk..',ESINDEXNAME)
+       ES.putSettings(index=ESINDEXNAME,body={ "refresh_interval" : "1s" })
+       logging.info('optimizing bulk : restoring index.number_of_replicas to previous state on %s after bulk..',ESINDEXNAME)
+       ES.putSettings(index=ESINDEXNAME,body={ "number_of_replicas" : replicaPrevState[ESINDEXNAME]['settings']['index']['number_of_replicas'] })
+       #only applpied during optimizing , max_num_segments is set to 5 in the below call.
+       #after merging it is set to ES defaults by ES itself.
+       logging.info('optimizing bulk : force_merging with max_num_segments=5 on %s',ESINDEXNAME)
+       ret= ES.forceMerge(index=ESINDEXNAME,max_num_segments=5)
+       if ret['_shards']['failed']!=0:
+          logging.warning("force merging partial.( see failed status ) : %s",ret)
+
+
+if __name__ == '__main__':
+   try:
+      # READ arguments
+      parser = argparse.ArgumentParser(description='Elasticsearch Curator')
+      parser.add_argument('ESACTION', action="store", default='cat' , help="any one action from [ load , count , getmapping , createmapping , delete , dump , deletebyquery ]")
+      parser.add_argument('ESINDEXNAME', action="store", default='none' , help="elastic search index")
+      parser.add_argument('-doctype', '--doctype',action="store", nargs='?', help="elasticsearch document type")
+      parser.add_argument('-field', '--field',action="store", nargs='?', help="elasticsearch document field name")
+      parser.add_argument('-datetime', '--datetime',action="store", nargs='?', help="timestamp (valid ISO format)")
+      parser.add_argument('JSONFILE', action="store", nargs='?', help="json file to load")
+      args = parser.parse_args()
+      ESACTION = args.ESACTION
+      ESINDEXNAME = args.ESINDEXNAME
+      ESTYPENAME = args.doctype
+      ESTYPEFIELD = args.field
+      ESDATETIME = args.datetime
+      JSONFILE = args.JSONFILE
+
+      try:
+        ESCLUSTER = os.environ['ESCLUSTER_NODES'].split(",")
+      except KeyError, e:
+        logging.exception(" Environment variable ESCLUSTER_NODES is not set : %s",e)
+        raise e
+
+      #ESPORT = 9201
+      logging.basicConfig(format='%(asctime)s [%(name)s] [%(levelname)s] [%(threadName)s] [msg:] %(message)s', level=logging.INFO)
+
+      if not ESACTION in 'load,count,getmapping,createmapping,delete,dump,deletebyquery'.split(","):
+         logging.error("option not available : %s ",ESACTION)
+         parser.print_help()
+         sys.exit(1)
+
+      ESHOSTS=[]
+      for esHostPort in ESCLUSTER:
+          esnode = esHostPort.split(":")
+          ESNODE = esnode[0]
+          ESPORT = 9200 if len(esnode)<2 else esnode[1]
+          esNodes = { "host" : ESNODE , "port" : ESPORT }
+          ESHOSTS.append(esNodes)
+      logging.info("Elasticsearch cluster : %s",ESHOSTS)
+
+      # instantiating elasticsearch conn.
+
+      # While it is better to sniff, in the sniff option below,
+      # client connection pool will sniff(check status/healthcheck) all the nodes seen in http://<host>:<port>/_nodes/_all/clear .
+      # For a container based cluster (e.g. : docker ), the node ips will be the container ips,
+      # which will be unavailable even within the hosted server as the container ip will be binded to the host ip.
+      # Sniffing it within/outside the host server will result in unavailable nodes.
+      # So, switching sniff off for handling this case..
+      #      es=Elasticsearch( hosts=ESHOSTS
+      #                       ,sniff_on_start=True
+      #                       ,sniff_on_connection_fail=True
+      #                       ,sniff_timeout=60
+      #                       ,timeout=60 )
+
+      es=Elasticsearch( hosts=ESHOSTS
+                       ,timeout=200 )
+
+      #user defined elasticsearch obj for user def functions
+      ES = ElasticSearch(es)
+      if ESACTION == 'load':
+         logging.info('preparing json to load to ES index : %s',ESINDEXNAME)
+         with open(JSONFILE,"r") as f:
+              data=json.load(f)
+         logging.info('loading json to ES index : %s',ESINDEXNAME)
+         curIdxSeting = optimizeBulk("start")
+         # slice and dice the data for bulk load. bulk load is way faster than iterating over docs.
+         docCount = len(data['hits']['hits'])
+         stepNum = docCount if docCount<=10000 else 10000
+         sliceCnt, bulkMsg = 1, []
+         #the bulk() api accepts index, create, delete, and update actions. Use the _op_type field to specify an action (_op_type defaults to index):
+         for i,src in enumerate(data['hits']['hits'], start=1):
+             EStype, docId, bodyData = src['_type'], src['_id'], src['_source']
+             appender={
+                        "_index": ESINDEXNAME,
+                        "_type": EStype,
+                        "_id": docId,
+                        "_source": bodyData
+                      }
+             bulkMsg.append(appender)
+             sliceCnt+= 1
+             if i >=docCount or sliceCnt==stepNum :
+                ES.postESData(bulkMsg)
+                sliceCnt, bulkMsg = 1, []
+                time.sleep(1)
+         optimizeBulk("end",curIdxSeting)
+         print "{0} {1} successful.".format(ESACTION,ESINDEXNAME)
+
+      if ESACTION == 'count':
+         getTotal=ES.getESData(index=ESINDEXNAME,size=0)
+         print "doc {0} in {1} : {2}".format(ESACTION,ESINDEXNAME,getTotal['hits']['total'])
+
+      if ESACTION == 'getmapping':
+         indexMapping=ES.getMapping(index=ESINDEXNAME)
+         with open('Mapping-'+ESINDEXNAME, 'w') as f:
+              json.dump(indexMapping[ESINDEXNAME],f,indent=4)
+         print "file Mapping-"+ESINDEXNAME+" created.."
+
+      if ESACTION == 'createmapping':
+         with open(JSONFILE,"r") as f:
+              idxMapping=json.load(f)
+         ES.createMapping(index=ESINDEXNAME,body=idxMapping)
+         print "{0} {1} successful.".format(ESACTION,ESINDEXNAME)
+
+      if ESACTION == 'delete':
+         ES.deleteIndex(index=ESINDEXNAME)
+         print "{0} {1} successful.".format(ESACTION,ESINDEXNAME)
+
+      if ESACTION == 'dump':
+         getTotal=ES.getESData(index=ESINDEXNAME,size=0)
+         totalDocs=getTotal['hits']['total']
+         print "total docs in {0} : {1}".format(ESINDEXNAME,totalDocs)
+         if totalDocs <= 10000:
+            dumpData=ES.getESData(index=ESINDEXNAME,size=totalDocs)
+         else:
+            print "scrolling..."
+            if totalDocs <= 2000000:
+               dumpData = ES.deepPaginate(index=ESINDEXNAME)
+            else:
+               dumpData = ES.idGenerator(index=ESINDEXNAME)
+         with open('Data-'+ESINDEXNAME, 'w') as f:
+              json.dump(dumpData, f, indent=4)
+         print "Dump Data-"+ESINDEXNAME+" created.."
+
+      if ESACTION == 'deletebyquery':
+         q = Queue()
+         # 3 threads
+         for i in xrange(3):
+             t = threading.Thread(target=threader,args=(ES.postESData,))
+             t.setDaemon(True)
+             t.start()
+         now = datetime.datetime.now()
+         tenHoursBack = now - datetime.timedelta(hours=10)
+         frmtDate = tenHoursBack.strftime('%Y-%m-%dT%H:%M:%S')
+         ESDATETIME = ESDATETIME if ESDATETIME else frmtDate
+         logging.info("fetching doc ids older than %s.",ESDATETIME)
+         dbQuery={
+             "query" : {
+               "range" : {
+                 ESTYPEFIELD : { "lte" : ESDATETIME }
+                         }
+                       }
+                   }
+         searchResult = ES.getESData(index=ESINDEXNAME,doc_type=ESTYPENAME,body=dbQuery,size=0)
+         docCount = searchResult['hits']['total']
+         logging.info("count of docs older than the given date : %s",docCount)
+         if docCount <= 10000:
+            dumpData = ES.getESData(index=ESINDEXNAME,doc_type=ESTYPENAME,body=dbQuery,fields=["_id"],size=docCount)
+         if docCount > 10000:
+            dumpData = ES.deepPaginate(index=ESINDEXNAME,doc_type=ESTYPENAME,body=dbQuery)
+         logging.info("purging the docs..")
+         delMsg=[]
+         for i,src in enumerate(dumpData['hits']['hits'], start=1):
+             EStype, docId = src['_type'], src['_id']
+             appender={   "_op_type": "delete",
+                          "_index": ESINDEXNAME,
+                          "_type": EStype,
+                          "_id": docId
+                      }
+             delMsg.append(appender)
+             #queue every 1000 docs
+             if i % 1000 == 0:
+                q.put(delMsg)
+                delMsg=[]
+                time.sleep(2)
+
+         # wait until the thread terminates.
+         q.join()
+
+         print "{0} : index {1} : type {2} : successful..".format(ESACTION,ESINDEXNAME,ESTYPENAME)
+
+   except Exception, e:
+      logging.exception(" Error %s %s : %s ",ESACTION,ESINDEXNAME,e)
