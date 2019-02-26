@@ -1,23 +1,28 @@
 node{
-	stage('set env'){
-		GIT_URL = "https://github.com/kameshyuva/python.git"
-		CRED_ID = 'test'
-		GIT_REPO = GIT_URL + "templates.git"
-		env.GIT_BRANCH = 'demo'
-		env.k8sFolder = 'k8s/api'
+    stage('set env'){
+		env.GIT_URL = "https://github.com/kameshyuva/"
+		env.CRED_ID = 'func_cma_jenkins'
+		GIT_REPO = GIT_URL + "python.git"
+		env.GIT_BRANCH = 'master'
+		env.K8SFOLDER = 'k8s/api'
 		env.MODULE = 'my-test-api'
-		env.ENVIRONMENT = 'int'
-	}
+		env.ENV_LIST = 'dev,int,trn,uat'
+    }
+
     stage('git clone'){
 		cleanWs()		
 		withCredentials([usernamePassword(credentialsId: CRED_ID, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
 			replacePattern = 'https://' + GIT_USERNAME + ':' + GIT_PASSWORD + '@'
 			env.GIT_PUSH_REPO = GIT_REPO.replaceAll('https://', replacePattern)
+                        env.GIT_PUSH_REPO = GIT_REPO
 			sh 'git config --global http.sslVerify false'
 			sh 'git clone ${GIT_PUSH_REPO} -b ${GIT_BRANCH} .'
 		}
-	}
-	stage('temp'){
+    }
+
+    stage('temp'){
+       dir('jinja'){
+           sh 'mkdir -p parsed'
 	   sh '''
 echo "import ConfigParser, os
 from jinja2 import Template, Environment, FileSystemLoader
@@ -25,7 +30,7 @@ from jinja2 import Template, Environment, FileSystemLoader
 config = ConfigParser.ConfigParser()
 config.read(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'properties', 'config.properties'))
 
-k8sDir = os.environ['k8sFolder']
+k8sDir = os.environ['K8SFOLDER']
 module = os.environ['MODULE']
 namespace = os.environ['ENVIRONMENT']
 
@@ -33,30 +38,57 @@ env = Environment(loader=FileSystemLoader(k8sDir))
 for yml in os.listdir(k8sDir):
     template = env.get_template(yml)
     fileName = os.path.basename(yml).split('_')[-1]
-    newFileName  = module + '_' + fileName
+    newFilePath  = 'parsed/' + namespace + '_' + module + '_' + fileName
     parsedTemplate = template.render(
       PROJECTNAME=module,
       NAMESPACE=namespace,
       KONGINGRESS=config.get(namespace,'KONGINGRESS'),
       KONGHOST=config.get(namespace,'KONGHOST')
     )
-    with open(newFileName, 'wb') as f:
+    with open(newFilePath, 'wb') as f:
 	   f.write(parsedTemplate)
 " > pyTemp.py
 '''
-	}
+       }
+    }
     stage('python'){
+     dir('jinja'){
+         withEnv(['PATH+EXTRA=/var/jenkins_home/.local/bin']) {
 		try{
 			sh 'pip -V'
 			sh 'python -c "import jinja2"'
 		}catch(err){
 			sh 'curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py'
-			sh 'python get-pip.py'
-			sh 'pip install Jinja2'
+			sh 'python get-pip.py --user'
+			sh 'pip install --user Jinja2'
 		}
-		sh 'python pyTemp.py'
-	} 
-	stage('archive'){
+                env.ENV_LIST.split(',').each{
+		    env.ENVIRONMENT = it
+                    sh 'python pyTemp.py'
+                }
+         }
+      }
+    }
+
+    stage('apply template'){
+         sh "mkdir -p ${MODULE}"
+         dir("${MODULE}"){
+            GIT_REPO = env.GIT_URL + env.MODULE + '.git'
+            withCredentials([usernamePassword(credentialsId: CRED_ID, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+                replacePattern = 'https://' + GIT_USERNAME + ':' + GIT_PASSWORD + '@'
+                 env.GIT_PUSH_REPO = GIT_REPO.replaceAll('https://', replacePattern)
+                 env.ENV_LIST.split(',').each{
+                     env.GIT_BRANCH = it
+                     sh 'git config --global http.sslVerify false'
+                     sh 'git clone ${GIT_PUSH_REPO} -b ${GIT_BRANCH} .'
+                     sh "cp -f ../parsed/${GIT_BRANCH}_${MODULE}*.yaml k8s/"
+                     sh 'head -1000 k8s/*yaml'
+                 }
+            }
+
+         }       
+    }
+    stage('archive'){
 		archiveArtifacts '**/*'
-	}  
-}
+    }  
+} 
