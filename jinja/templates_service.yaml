@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ PROJECTNAME }}
+  namespace: {{ NAMESPACE }}
+  labels:
+    k8s-app: {{ PROJECTNAME }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/{{ PROJECTNAME }}/actuator/prometheus"
+    prometheus.io/apptype: "spring"
+spec:
+  selector:
+    k8s-app: {{ PROJECTNAME }}
+  type: ClusterIP
+  ports:
+  - name: web
+    port: 8080
+    protocol: TCP
