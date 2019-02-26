@@ -1,0 +1,62 @@
+node{
+	stage('set env'){
+		GIT_URL = "https://github.com/kameshyuva/python.git"
+		CRED_ID = 'test'
+		GIT_REPO = GIT_URL + "templates.git"
+		env.GIT_BRANCH = 'demo'
+		env.k8sFolder = 'k8s/api'
+		env.MODULE = 'my-test-api'
+		env.ENVIRONMENT = 'int'
+	}
+    stage('git clone'){
+		cleanWs()		
+		withCredentials([usernamePassword(credentialsId: CRED_ID, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+			replacePattern = 'https://' + GIT_USERNAME + ':' + GIT_PASSWORD + '@'
+			env.GIT_PUSH_REPO = GIT_REPO.replaceAll('https://', replacePattern)
+			sh 'git config --global http.sslVerify false'
+			sh 'git clone ${GIT_PUSH_REPO} -b ${GIT_BRANCH} .'
+		}
+	}
+	stage('temp'){
+	   sh '''
+echo "import ConfigParser, os
+from jinja2 import Template, Environment, FileSystemLoader
+
+config = ConfigParser.ConfigParser()
+config.read(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'properties', 'config.properties'))
+
+k8sDir = os.environ['k8sFolder']
+module = os.environ['MODULE']
+namespace = os.environ['ENVIRONMENT']
+
+env = Environment(loader=FileSystemLoader(k8sDir))
+for yml in os.listdir(k8sDir):
+    template = env.get_template(yml)
+    fileName = os.path.basename(yml).split('_')[-1]
+    newFileName  = module + '_' + fileName
+    parsedTemplate = template.render(
+      PROJECTNAME=module,
+      NAMESPACE=namespace,
+      KONGINGRESS=config.get(namespace,'KONGINGRESS'),
+      KONGHOST=config.get(namespace,'KONGHOST')
+    )
+    with open(newFileName, 'wb') as f:
+	   f.write(parsedTemplate)
+" > pyTemp.py
+'''
+	}
+    stage('python'){
+		try{
+			sh 'pip -V'
+			sh 'python -c "import jinja2"'
+		}catch(err){
+			sh 'curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py'
+			sh 'python get-pip.py'
+			sh 'pip install Jinja2'
+		}
+		sh 'python pyTemp.py'
+	} 
+	stage('archive'){
+		archiveArtifacts '**/*'
+	}  
+}
