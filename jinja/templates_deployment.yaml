@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ PROJECTNAME }}
+  namespace: {{ NAMESPACE }}
+  labels:
+    k8s-app: {{ PROJECTNAME }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: {{ PROJECTNAME }}
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/{{ PROJECTNAME }}/actuator/prometheus"
+        prometheus.io/apptype: "spring"
+      labels:
+        k8s-app: {{ PROJECTNAME }}
+    spec:
+      containers:
+      - name: {{ PROJECTNAME }}
+        image: registryurl:9999/{{ PROJECTNAME }}:1.0-develop
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: web
+          protocol: TCP
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          valueFrom:
+            configMapKeyRef:
+              name: lm-global-config-map 
+              key: envIdentifier
+        resources:
+          limits:
+            cpu: 400m
+            memory: 512Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /{{ PROJECTNAME }}/actuator/health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 120
+          timeoutSeconds: 1
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /{{ PROJECTNAME }}/actuator/health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 120
+          timeoutSeconds: 1
+          periodSeconds: 5
